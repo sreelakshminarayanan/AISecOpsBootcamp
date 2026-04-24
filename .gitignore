@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Lab outputs
+outputs/*.csv
+outputs/*.json
+outputs/*.log
+results/*.csv
+results/*.json
+results/*.log
+screenshots/*
+
+
+# Local secrets / env
+.env
