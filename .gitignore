@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+<<<<<<< HEAD
 *.pyc
 *.pyo
 *.pyd
@@ -23,3 +24,24 @@ screenshots/*
 
 # Local secrets / env
 .env
+=======
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Lab artifacts
+data/logs/*.jsonl
+!data/logs/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+>>>>>>> d0821e5 (Prompt Injection Labs)
