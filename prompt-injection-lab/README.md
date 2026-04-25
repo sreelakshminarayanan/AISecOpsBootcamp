@@ -1,6 +1,6 @@
 # Prompt Injection Lab
 
-Hands-on lab series for testing LLM prompt injection, jailbreak behaviour, and telemetry using local Ollama models. The app is built with Streamlit and does not use canned target responses. Every target answer is generated live by the selected local model.
+Hands-on lab series for testing LLM prompt injection, jailbreak behaviour, and telemetry using local Ollama models. The app is built with Streamlit. Every target answer is generated live by the selected local model.
 
 Implemented labs:
 
