@@ -57,6 +57,23 @@ def fetch_attack_stix(url: str) -> dict[str, Any]:
     return data
 
 
+def get_attack_version(stix_data: dict[str, Any]) -> str:
+    """
+    Return the ATT&CK release version (for example '19.1').
+
+    The version lives on the x-mitre-collection object as x_mitre_version. This
+    is the real ATT&CK version of the dataset and is what downstream artifacts
+    (such as the Navigator layer) must report, rather than a hardcoded number.
+    """
+    for obj in stix_data.get("objects", []):
+        if obj.get("type") == "x-mitre-collection":
+            version = str(obj.get("x_mitre_version", "")).strip()
+            if version:
+                return version
+
+    return ""
+
+
 def get_external_attack_id(stix_object: dict[str, Any]) -> str:
     for ref in stix_object.get("external_references", []):
         if ref.get("source_name") == "mitre-attack" and ref.get("external_id"):
@@ -184,10 +201,15 @@ def build_metadata(stix_data: dict[str, Any], techniques: list[dict[str, Any]], 
 
     latest_modified = max(modified_values) if modified_values else ""
 
+    attack_version = get_attack_version(stix_data)
+    attack_version_major = attack_version.split(".", 1)[0] if attack_version else ""
+
     return {
         "dataset": "Enterprise ATT&CK",
         "source_url": source_url,
         "synced_at_utc": datetime.now(UTC).isoformat(),
+        "attack_version": attack_version,
+        "attack_version_major": attack_version_major,
         "stix_bundle_id": bundle_id,
         "stix_bundle_type": bundle_type,
         "stix_spec_version": attack_spec_version,
@@ -288,6 +310,36 @@ def validate_outputs():
         raise RuntimeError("Technique CSV does not appear to contain ATT&CK technique IDs.")
 
 
+def sync_attack_dataset(
+    url: str = DEFAULT_ENTERPRISE_ATTACK_URL,
+    include_deprecated: bool = False,
+    save_raw: bool = False,
+) -> dict[str, Any]:
+    """
+    Download the current Enterprise ATT&CK dataset, parse it, and write the local
+    technique cache. Returns the metadata dict. Importable so the unified app can
+    run the sync in-process rather than shelling out to a subprocess.
+    """
+    stix_data = fetch_attack_stix(url)
+    techniques = parse_enterprise_techniques(
+        stix_data=stix_data,
+        include_deprecated=include_deprecated,
+    )
+    metadata = build_metadata(
+        stix_data=stix_data,
+        techniques=techniques,
+        source_url=url,
+    )
+    save_outputs(
+        stix_data=stix_data,
+        techniques=techniques,
+        metadata=metadata,
+        save_raw=save_raw,
+    )
+    validate_outputs()
+    return metadata
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download and parse the latest Enterprise ATT&CK STIX dataset into a local technique cache."
@@ -320,35 +372,17 @@ def main():
     print("Downloading Enterprise ATT&CK STIX dataset...")
 
     try:
-        stix_data = fetch_attack_stix(args.url)
-
-        print("Parsing Enterprise ATT&CK techniques...")
-        techniques = parse_enterprise_techniques(
-            stix_data=stix_data,
+        metadata = sync_attack_dataset(
+            url=args.url,
             include_deprecated=args.include_deprecated,
-        )
-
-        metadata = build_metadata(
-            stix_data=stix_data,
-            techniques=techniques,
-            source_url=args.url,
-        )
-
-        print("Saving local ATT&CK cache...")
-        save_outputs(
-            stix_data=stix_data,
-            techniques=techniques,
-            metadata=metadata,
             save_raw=args.save_raw,
         )
-
-        validate_outputs()
-
     except Exception as exc:
         print(f"[bold red]ERROR:[/bold red] {exc}")
         sys.exit(1)
 
     print("[bold green]ATT&CK dataset sync complete.[/bold green]")
+    print(f"ATT&CK version: {metadata.get('attack_version') or 'unknown'}")
     print(f"Technique count: {metadata['technique_count']}")
     print(f"Sub-technique count: {metadata['subtechnique_count']}")
     print(f"Latest technique modified timestamp: {metadata['latest_technique_modified']}")

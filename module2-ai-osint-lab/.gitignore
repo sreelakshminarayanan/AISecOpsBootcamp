@@ -15,6 +15,7 @@ Thumbs.db
 outputs/*.csv
 outputs/*.json
 outputs/*.log
+outputs/*.md
 
 
 # Local secrets / env

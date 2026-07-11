@@ -304,9 +304,13 @@ def build_layer(
     dataset_name = normalize_text(attack_metadata.get("dataset"))
     synced_at = normalize_text(attack_metadata.get("synced_at_utc"))
     technique_count = normalize_text(attack_metadata.get("technique_count"))
+    attack_version = normalize_text(attack_metadata.get("attack_version"))
 
     if dataset_name:
         metadata.append({"name": "ATT&CK Dataset", "value": dataset_name})
+
+    if attack_version:
+        metadata.append({"name": "ATT&CK Version", "value": attack_version})
 
     if synced_at:
         metadata.append({"name": "ATT&CK Cache Synced At", "value": synced_at})
@@ -314,9 +318,20 @@ def build_layer(
     if technique_count:
         metadata.append({"name": "ATT&CK Cache Technique Count", "value": technique_count})
 
+    # The Navigator layer must declare the ATT&CK version of the data it carries.
+    # Derive it from the synced cache metadata instead of hardcoding a number, so
+    # the layer always matches whatever ATT&CK release was actually pulled.
+    attack_major = normalize_text(attack_metadata.get("attack_version_major"))
+
+    if not attack_major and attack_version:
+        attack_major = attack_version.split(".", 1)[0]
+
+    if not attack_major:
+        attack_major = "19"
+
     layer = {
         "versions": {
-            "attack": "18",
+            "attack": attack_major,
             "navigator": "5.2.0",
             "layer": "4.5",
         },
@@ -465,6 +480,12 @@ def run(
     ]
 
     print(pd.DataFrame(preview))
+
+    return {
+        "paths": paths,
+        "technique_count": len(layer["techniques"]),
+        "attack_version": layer["versions"]["attack"],
+    }
 
 
 def main():

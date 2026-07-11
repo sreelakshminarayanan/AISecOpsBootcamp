@@ -9,10 +9,6 @@ LAB2_1_PATTERNS = [
     "lab2_1_*.csv",
     "lab2_1_*.json",
     "lab2_1_*.md",
-    "url_osint_*",
-    "extracted_iocs.csv",
-    "extracted_iocs.json",
-    "urlhaus_enrichment.csv",
 ]
 
 # Lab 2.2 generated artifacts

@@ -12,8 +12,10 @@ from typing import Callable
 import streamlit as st
 
 from core.config import APP_ICON, APP_TITLE
+from core.theme import apply_cyber_theme, render_status
 from labs.lab1_concierge import page as lab1_page
 from labs.lab2_slowboil import page as lab2_page
+from labs.lab3_poisonedrag import page as lab3_page
 
 
 st.set_page_config(
@@ -22,20 +24,25 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+apply_cyber_theme()
 
 
 LABS: dict[str, Callable[[], None]] = {
-    "Lab 1: The Leaky Concierge": lab1_page.render,
-    "Lab 2: The Slow Boil": lab2_page.render,
+    "01  The Leaky Concierge": lab1_page.render,
+    "02  The Slow Boil": lab2_page.render,
+    "03  RAG Poisoning": lab3_page.render,
 }
 
 
 def _render_app_sidebar() -> str:
     with st.sidebar:
-        st.markdown(f"# {APP_ICON} {APP_TITLE}")
-        st.caption(
-            "Hands-on lab series for LLM prompt injection and jailbreak testing. "
-            "Only operational labs are shown."
+        st.markdown(
+            '<div class="cyber-brand">'
+            '<div class="cyber-brand__eyebrow">Offensive AI Range</div>'
+            f'<div class="cyber-brand__title">{APP_TITLE}</div>'
+            '<div class="cyber-brand__meta">LOCAL LAB ENVIRONMENT / v2.0</div>'
+            '</div>',
+            unsafe_allow_html=True,
         )
         st.divider()
         selected = st.radio(
@@ -50,6 +57,7 @@ def _render_app_sidebar() -> str:
 
 def main() -> None:
     selected = _render_app_sidebar()
+    render_status()
     LABS[selected]()
 
 

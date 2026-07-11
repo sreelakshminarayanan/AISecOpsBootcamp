@@ -1,0 +1,17 @@
+{
+  "category": "windows/process_creation",
+  "fields": [
+    "Image",
+    "OriginalFileName",
+    "CommandLine",
+    "ParentImage",
+    "ParentCommandLine",
+    "User",
+    "IntegrityLevel",
+    "Hashes",
+    "ProcessId",
+    "ParentProcessId",
+    "LogonId"
+  ]
+}
+

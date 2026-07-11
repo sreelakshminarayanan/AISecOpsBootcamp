@@ -902,6 +902,16 @@ def run(
         print("[bold yellow]Review mappings preview[/bold yellow]")
         print(review_preview_df[["attack_id", "name", "tactics", "confidence", "review_reason"]])
 
+    return {
+        "paths": paths,
+        "final": final_mappings,
+        "review": review_mappings,
+        "rejected": rejected,
+        "candidates": candidates,
+        "metadata": metadata,
+        "explicit_ids": sorted(explicit_ids),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -928,8 +938,8 @@ def main():
 
     parser.add_argument(
         "--model",
-        default="llama3.2:3b",
-        help="Local Ollama model name.",
+        default=None,
+        help="Local Ollama model name. Defaults to the first installed model.",
     )
 
     parser.add_argument(
@@ -948,11 +958,21 @@ def main():
     args = parser.parse_args()
 
     try:
+        model = args.model
+
+        if not args.no_ai:
+            try:
+                from tools.ollama_client import resolve_model
+            except ModuleNotFoundError:
+                from ollama_client import resolve_model
+
+            model = resolve_model(args.model)
+
         run(
             evidence_path_arg=args.evidence,
             ioc_path_arg=args.iocs,
             attack_cache_arg=args.attack_cache,
-            model=args.model,
+            model=model or "",
             candidate_count=args.candidate_count,
             no_ai=args.no_ai,
         )

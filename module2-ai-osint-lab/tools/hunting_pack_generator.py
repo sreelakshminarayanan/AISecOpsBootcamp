@@ -694,6 +694,13 @@ def run(
     print(f"Latest JSON output: {paths['latest_json']}")
     print("=" * 90)
 
+    return {
+        "paths": paths,
+        "final_count": len(mapping_df),
+        "review_count": len(review_df) if not review_df.empty else 0,
+        "markdown_length": len(markdown_report),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
