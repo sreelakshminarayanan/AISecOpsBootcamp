@@ -158,6 +158,10 @@ ollama pull qwen2.5:7b
 streamlit run app.py
 ```
 
+
+Input file : https://unit42.paloaltonetworks.com/flutterbridge-new-fluttershell-backdoor/
+
+#
 If PowerShell blocks the activation script, allow it for the current user and try the activation line again:
 
 ```powershell
