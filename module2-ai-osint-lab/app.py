@@ -39,9 +39,13 @@ from tools.threat_report_ioc_extractor import (
     save_outputs,
 )
 from tools.attack_dataset_sync import sync_attack_dataset
-from tools.attack_mapping_engine import run as run_attack_mapping
+from tools.attack_mapping_engine import (
+    build_manual_mapping_proposal,
+    run as run_attack_mapping,
+    save_analyst_decisions,
+)
 from tools.attack_navigator_layer_generator import run as run_navigator_layer
-from tools.hunting_pack_generator import run as run_hunting_pack
+from tools.ai_hunting_pack_generator import run as run_ai_hunting_pack
 
 
 OUTPUT_DIR = Path("outputs")
@@ -114,6 +118,16 @@ for key, default in {
     "final_url": "",
     "easy_summary": "",
     "analyst_brief": "",
+    "evidence_path": "",
+    "ioc_path": "",
+    "mapping_final_path": "",
+    "mapping_review_path": "",
+    "mapping_rejected_path": "",
+    "mapping_json_path": "",
+    "navigator_path": "",
+    "hunting_md_path": "",
+    "hunting_json_path": "",
+    "manual_mapping_rows": [],
 }.items():
     st.session_state.setdefault(key, default)
 
@@ -135,16 +149,25 @@ with st.sidebar:
         selected_model = None
     else:
         st.success(f"Ollama online. {len(installed_models)} model(s) installed.")
-        selected_model = st.selectbox("Local Ollama model", installed_models, index=0)
+        selected_model = st.selectbox("Research and ATT&CK model", installed_models, index=0)
+        hunting_model = st.selectbox(
+            "Validation and hunting model",
+            installed_models,
+            index=min(1, len(installed_models) - 1),
+            help="Use your strongest available model here. It independently validates mappings and generates the hunting pack.",
+        )
 
-    st.caption("The model list is read from your Ollama instance. Nothing is hardcoded.")
+    if not ollama_online or not installed_models:
+        hunting_model = None
+
+    st.caption("Both model lists are read from your Ollama instance. Nothing is hardcoded.")
 
     st.divider()
     candidate_count = st.slider(
         "ATT&CK candidate count",
         min_value=10,
-        max_value=100,
-        value=40,
+        max_value=50,
+        value=20,
         step=10,
         help="Techniques scored and handed to the model for mapping. Lower values reduce noise for small models.",
     )
@@ -188,10 +211,10 @@ tab_report, tab_mapping, tab_navigator, tab_hunting, tab_deliverables = st.tabs(
 # Tab 1: Report to IOCs                                                        #
 # --------------------------------------------------------------------------- #
 with tab_report:
-    st.subheader("Extract validated IOCs and AI summaries from a public report")
+    st.subheader("Extract observable candidates and AI summaries from a public report")
     st.write(
         "Paste a public threat intel report URL. The app checks robots.txt, fetches the page passively, "
-        "extracts article text, links, and validated IOCs, and asks the local model for an easy summary and an "
+        "extracts article text, links, and observable candidates, and asks the local model for an easy summary and an "
         "analyst brief. Use public or authorized sources only. No scanning, exploitation, or private content."
     )
 
@@ -256,13 +279,14 @@ with tab_report:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Article chars", evidence["article"]["article_text_length"])
             c2.metric("Links", evidence["link_count"])
-            c3.metric("Accepted IOCs", evidence["accepted_ioc_count"])
+            c3.metric("Observable candidates", evidence["accepted_ioc_count"])
             c4.metric("Rejected FPs", evidence["rejected_false_positive_count"])
 
-            st.markdown("#### Validated IOCs")
+            st.markdown("#### Extracted observable candidates")
+            st.caption("Syntax and context filters have been applied, but analysts must verify attribution before operational use.")
             accepted_df = pd.DataFrame(build_ioc_rows(iocs))
             if accepted_df.empty:
-                st.warning("No validated IOCs extracted from this page.")
+                st.warning("No observable candidates were extracted from this page.")
             else:
                 st.dataframe(accepted_df, use_container_width=True, hide_index=True)
 
@@ -314,6 +338,12 @@ with tab_report:
                     ai_brief=analyst_brief,
                     easy_summary=easy_summary,
                 )
+                st.session_state["evidence_path"] = str(paths["json"])
+                st.session_state["ioc_path"] = str(paths["ioc_csv"])
+                st.session_state["mapping_final_path"] = ""
+                st.session_state["mapping_review_path"] = ""
+                st.session_state["mapping_rejected_path"] = ""
+                st.session_state["manual_mapping_rows"] = []
 
             st.success("Report analyzed and outputs saved. Move to the ATT&CK Mapping tab.")
             st.write(f"Evidence JSON: `{paths['json']}`")
@@ -349,8 +379,8 @@ with tab_mapping:
     st.divider()
     st.write(
         "The model proposes ATT&CK mappings for the latest Lab 2.1 evidence. Every returned technique ID is "
-        "validated against the local ATT&CK cache. High and medium confidence go to Final; low confidence goes "
-        "to Review; anything invalid or unsupported goes to Rejected."
+        "checked against the local ATT&CK cache and source evidence. Valid IDs always remain reviewable, even when "
+        "grounding is uncertain or the ID falls outside the candidate set. Only the analyst can approve a Final mapping."
     )
 
     map_col1, map_col2 = st.columns(2)
@@ -365,17 +395,21 @@ with tab_mapping:
                 with st.spinner(f"Mapping with {selected_model}..."):
                     try:
                         result = run_attack_mapping(
-                            evidence_path_arg=None,
-                            ioc_path_arg=None,
+                            evidence_path_arg=st.session_state.get("evidence_path") or None,
+                            ioc_path_arg=st.session_state.get("ioc_path") or None,
                             attack_cache_arg=None,
                             model=selected_model,
                             candidate_count=candidate_count,
                             no_ai=False,
                         )
                         st.success(
-                            f"Mapping complete. Final {len(result['final'])}, "
-                            f"Review {len(result['review'])}, Rejected {len(result['rejected'])}."
+                            f"Grounded proposals ready. Review {len(result['review'])}, "
+                            f"Rejected {len(result['rejected'])}. Approve mappings below before export."
                         )
+                        st.session_state["mapping_final_path"] = str(result["paths"]["final_csv"])
+                        st.session_state["mapping_review_path"] = str(result["paths"]["review_csv"])
+                        st.session_state["mapping_rejected_path"] = str(result["paths"]["rejected_csv"])
+                        st.session_state["mapping_json_path"] = str(result["paths"]["final_json"])
                     except Exception as exc:
                         st.error(f"Mapping failed: {exc}")
 
@@ -387,22 +421,107 @@ with tab_mapping:
                 with st.spinner("Validating explicit ATT&CK IDs found in the evidence..."):
                     try:
                         result = run_attack_mapping(
-                            evidence_path_arg=None,
-                            ioc_path_arg=None,
+                            evidence_path_arg=st.session_state.get("evidence_path") or None,
+                            ioc_path_arg=st.session_state.get("ioc_path") or None,
                             attack_cache_arg=None,
                             model="",
                             candidate_count=candidate_count,
                             no_ai=True,
                         )
-                        st.success(f"Validation complete. Final {len(result['final'])}.")
+                        st.success(f"Explicit-ID proposals ready for review: {len(result['review'])}.")
+                        st.session_state["mapping_final_path"] = str(result["paths"]["final_csv"])
+                        st.session_state["mapping_review_path"] = str(result["paths"]["review_csv"])
+                        st.session_state["mapping_rejected_path"] = str(result["paths"]["rejected_csv"])
+                        st.session_state["mapping_json_path"] = str(result["paths"]["final_json"])
                     except Exception as exc:
                         st.error(f"Validation failed: {exc}")
 
-    final_df = read_csv(LATEST_FINAL_MAPPING_CSV)
-    review_df = read_csv(LATEST_REVIEW_MAPPING_CSV)
-    rejected_df = read_csv(LATEST_REJECTED_MAPPING_CSV)
+    final_path = Path(st.session_state.get("mapping_final_path") or LATEST_FINAL_MAPPING_CSV)
+    review_path = Path(st.session_state.get("mapping_review_path") or LATEST_REVIEW_MAPPING_CSV)
+    rejected_path = Path(st.session_state.get("mapping_rejected_path") or LATEST_REJECTED_MAPPING_CSV)
+    final_df = read_csv(final_path)
+    review_df = read_csv(review_path)
+    rejected_df = read_csv(rejected_path)
 
-    t_final, t_review, t_rejected = st.tabs(["Final mappings", "Review mappings", "Rejected or uncertain"])
+    st.markdown("#### Add or recover a mapping manually")
+    st.caption(
+        "If the AI omitted a technique or could not verify its quote, enter a valid ATT&CK ID here. "
+        "It will enter Review and can be approved with an analyst note."
+    )
+    with st.form("manual_mapping_form", clear_on_submit=True):
+        manual_col1, manual_col2 = st.columns([1, 3])
+        with manual_col1:
+            manual_attack_id = st.text_input("ATT&CK ID", placeholder="T1059.001")
+        with manual_col2:
+            manual_reason = st.text_input(
+                "Reason or source context",
+                placeholder="The report describes encoded PowerShell execution.",
+            )
+        add_manual = st.form_submit_button("Add to Review")
+
+    if add_manual:
+        try:
+            manual_row = build_manual_mapping_proposal(manual_attack_id, manual_reason)
+            existing_rows = [
+                row
+                for row in st.session_state.get("manual_mapping_rows", [])
+                if row.get("attack_id") != manual_row["attack_id"]
+            ]
+            st.session_state["manual_mapping_rows"] = existing_rows + [manual_row]
+            st.success(f"{manual_row['attack_id']} added to Review.")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not add mapping: {exc}")
+
+    manual_df = pd.DataFrame(st.session_state.get("manual_mapping_rows", []))
+    proposals_df = pd.concat([final_df, review_df, manual_df], ignore_index=True)
+    if not proposals_df.empty:
+        proposals_df = proposals_df.drop_duplicates(subset=["attack_id"], keep="first")
+        proposals_df["approve"] = proposals_df.get("disposition", "").astype(str).eq("final")
+        if "analyst_notes" not in proposals_df.columns:
+            proposals_df["analyst_notes"] = ""
+
+        st.markdown("#### Analyst approval")
+        st.caption(
+            "Grounding warnings do not block review. The model cannot promote anything to Final. "
+            "You can approve any valid ATT&CK mapping after reviewing it. Analyst notes are optional."
+        )
+        review_columns = [
+            "approve", "attack_id", "analyst_notes", "name", "confidence", "evidence_chunk_id",
+            "evidence", "validation_status", "review_reason", "rationale",
+        ]
+        edited_df = st.data_editor(
+            proposals_df[review_columns],
+            use_container_width=True,
+            hide_index=True,
+            disabled=[column for column in review_columns if column not in {"approve", "analyst_notes"}],
+            column_config={
+                "approve": st.column_config.CheckboxColumn("Approve for Final"),
+                "analyst_notes": st.column_config.TextColumn("Analyst notes"),
+            },
+            key="mapping_approval_editor",
+        )
+
+        if st.button("Save analyst decisions", type="primary"):
+            try:
+                decision_fields = edited_df[["attack_id", "approve", "analyst_notes"]]
+                merged_df = proposals_df.drop(columns=["approve", "analyst_notes"], errors="ignore").merge(
+                    decision_fields, on="attack_id", how="left"
+                )
+                decision_result = save_analyst_decisions(merged_df)
+                st.session_state["mapping_final_path"] = str(decision_result["paths"]["final_csv"])
+                st.session_state["mapping_review_path"] = str(decision_result["paths"]["review_csv"])
+                st.session_state["mapping_json_path"] = str(decision_result["paths"]["final_json"])
+                st.session_state["manual_mapping_rows"] = []
+                st.success(
+                    f"Decisions saved. Approved {len(decision_result['final'])}, "
+                    f"pending {len(decision_result['review'])}."
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Could not save analyst decisions: {exc}")
+
+    t_final, t_review, t_rejected = st.tabs(["Final mappings", "Review mappings", "Hard rejected"])
     with t_final:
         if final_df.empty:
             st.info("No final mappings yet.")
@@ -415,8 +534,12 @@ with tab_mapping:
             st.dataframe(review_df, use_container_width=True, hide_index=True)
     with t_rejected:
         if rejected_df.empty:
-            st.info("No rejected mappings yet.")
+            st.info("No malformed or unknown ATT&CK IDs were rejected.")
         else:
+            st.caption(
+                "Only malformed IDs and IDs missing from the current ATT&CK cache are hard rejected. "
+                "Use the manual mapping form to add the correct technique ID."
+            )
             st.dataframe(rejected_df, use_container_width=True, hide_index=True)
 
 
@@ -433,7 +556,7 @@ with tab_navigator:
         with st.spinner("Generating Navigator layer..."):
             try:
                 result = run_navigator_layer(
-                    mapping_csv=None,
+                    mapping_csv=st.session_state.get("mapping_final_path") or None,
                     layer_name="Module 2 AI-Mapped Threat Report Layer",
                     description=(
                         "ATT&CK Navigator layer generated from Module 2 final mappings. Mappings are AI-assisted, "
@@ -445,11 +568,13 @@ with tab_navigator:
                 st.success(
                     f"Layer generated. {result['technique_count']} techniques, ATT&CK v{result['attack_version']}."
                 )
+                st.session_state["navigator_path"] = str(result["paths"]["layer"])
             except Exception as exc:
                 st.error(f"Navigator layer generation failed: {exc}")
 
-    layer_text = read_text(LATEST_NAVIGATOR_LAYER_JSON)
-    st.write(f"Layer file: `{LATEST_NAVIGATOR_LAYER_JSON}` - {path_status(LATEST_NAVIGATOR_LAYER_JSON)}")
+    current_layer_path = Path(st.session_state.get("navigator_path") or LATEST_NAVIGATOR_LAYER_JSON)
+    layer_text = read_text(current_layer_path)
+    st.write(f"Layer file: `{current_layer_path}` - {path_status(current_layer_path)}")
     if layer_text:
         with st.expander("Preview Navigator layer JSON"):
             st.code(layer_text[:12000], language="json")
@@ -462,29 +587,38 @@ with tab_navigator:
 with tab_hunting:
     st.subheader("Generate a SOC hunting pack")
     st.write(
-        "Builds a Markdown hunting pack from the final mappings and IOCs: hunting questions plus starter Splunk SPL "
-        "and Microsoft Sentinel or Defender KQL. These are starter hunts, not production detections. Tune to your "
-        "SIEM field names before operational use."
+        "The second Ollama model independently validates the approved ATT&CK mappings against the original evidence, "
+        "then generates technique-specific hypotheses, SPL, KQL, log requirements, false positives, triage steps, "
+        "and detection opportunities. Output is schema-validated before it is saved."
     )
 
     if st.button("Generate hunting pack", type="primary"):
-        with st.spinner("Generating hunting pack..."):
-            try:
-                result = run_hunting_pack(
-                    mapping_csv=None,
-                    review_csv=None,
-                    iocs_csv=None,
-                    source_url=st.session_state.get("final_url", ""),
-                )
-                st.success(
-                    f"Hunting pack generated. {result['final_count']} final techniques, "
-                    f"{result['markdown_length']:,} chars."
-                )
-            except Exception as exc:
-                st.error(f"Hunting pack generation failed: {exc}")
+        if not hunting_model:
+            st.error("Select a validation and hunting model in the sidebar.")
+        elif not st.session_state.get("mapping_final_path"):
+            st.error("Approve and save at least one ATT&CK mapping first.")
+        else:
+            with st.spinner(f"{hunting_model} is validating mappings and generating the hunting pack..."):
+                try:
+                    result = run_ai_hunting_pack(
+                        mapping_csv=st.session_state.get("mapping_final_path"),
+                        iocs_csv=st.session_state.get("ioc_path") or "",
+                        evidence_json=st.session_state.get("evidence_path") or "",
+                        model=hunting_model,
+                        source_url=st.session_state.get("final_url", ""),
+                    )
+                    st.success(
+                        f"AI hunting pack generated with {result['model']}. "
+                        f"Validated {result['final_count']} mapping(s), created {result['hunt_count']} hunt(s)."
+                    )
+                    st.session_state["hunting_md_path"] = str(result["paths"]["markdown"])
+                    st.session_state["hunting_json_path"] = str(result["paths"]["json"])
+                except Exception as exc:
+                    st.error(f"AI hunting pack generation failed: {exc}")
 
-    hunting_md = read_text(LATEST_HUNTING_PACK_MD)
-    st.write(f"Markdown: `{LATEST_HUNTING_PACK_MD}` - {path_status(LATEST_HUNTING_PACK_MD)}")
+    current_hunting_path = Path(st.session_state.get("hunting_md_path") or LATEST_HUNTING_PACK_MD)
+    hunting_md = read_text(current_hunting_path)
+    st.write(f"Markdown: `{current_hunting_path}` - {path_status(current_hunting_path)}")
     if hunting_md:
         with st.expander("Preview hunting pack"):
             st.markdown(hunting_md[:25000])
@@ -499,27 +633,27 @@ with tab_deliverables:
 
     with d1:
         st.markdown("**ATT&CK mapping**")
-        download_if_exists("Final mapping CSV", LATEST_FINAL_MAPPING_CSV, "text/csv")
-        download_if_exists("Final mapping JSON", LATEST_FINAL_MAPPING_JSON, "application/json")
-        download_if_exists("Review mapping CSV", LATEST_REVIEW_MAPPING_CSV, "text/csv")
-        download_if_exists("Rejected mapping CSV", LATEST_REJECTED_MAPPING_CSV, "text/csv")
+        download_if_exists("Final mapping CSV", Path(st.session_state.get("mapping_final_path") or LATEST_FINAL_MAPPING_CSV), "text/csv")
+        download_if_exists("Final mapping JSON", Path(st.session_state.get("mapping_json_path") or LATEST_FINAL_MAPPING_JSON), "application/json")
+        download_if_exists("Review mapping CSV", Path(st.session_state.get("mapping_review_path") or LATEST_REVIEW_MAPPING_CSV), "text/csv")
+        download_if_exists("Rejected mapping CSV", Path(st.session_state.get("mapping_rejected_path") or LATEST_REJECTED_MAPPING_CSV), "text/csv")
 
     with d2:
         st.markdown("**Navigator and IOCs**")
-        download_if_exists("Navigator layer JSON", LATEST_NAVIGATOR_LAYER_JSON, "application/json")
-        download_if_exists("Lab 2.1 IOC CSV", LATEST_IOCS_CSV, "text/csv")
+        download_if_exists("Navigator layer JSON", Path(st.session_state.get("navigator_path") or LATEST_NAVIGATOR_LAYER_JSON), "application/json")
+        download_if_exists("Lab 2.1 IOC CSV", Path(st.session_state.get("ioc_path") or LATEST_IOCS_CSV), "text/csv")
 
     with d3:
         st.markdown("**Hunting pack**")
-        download_if_exists("Hunting pack Markdown", LATEST_HUNTING_PACK_MD, "text/markdown")
-        download_if_exists("Hunting pack JSON", LATEST_HUNTING_PACK_JSON, "application/json")
+        download_if_exists("Hunting pack Markdown", Path(st.session_state.get("hunting_md_path") or LATEST_HUNTING_PACK_MD), "text/markdown")
+        download_if_exists("Hunting pack JSON", Path(st.session_state.get("hunting_json_path") or LATEST_HUNTING_PACK_JSON), "application/json")
 
     st.divider()
     st.subheader("Analyst quality gate")
     st.markdown(
         """
 1. Do the final ATT&CK mappings match behavior described in the source report?
-2. Are low-confidence mappings kept in the review bucket, not promoted to final?
+2. Does every final mapping have an exact source quote and explicit analyst approval?
 3. Does the Navigator layer contain only final mappings, tagged with the correct ATT&CK version?
 4. Does the hunting pack state that SPL and KQL are starter hunts, not production detections?
 5. Are IOCs verified against the original report, with false positives separated?

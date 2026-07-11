@@ -1,7 +1,9 @@
 import argparse
+import hashlib
 import json
 import ipaddress
 import re
+import socket
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -24,6 +26,9 @@ OUTPUT_DIR = Path("outputs")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 DEFAULT_USER_AGENT = "AI-SecOps-Bootcamp-OSINT-Lab/1.0"
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
+ALLOWED_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
 
 CVE_REGEX = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 MITRE_TECHNIQUE_REGEX = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
@@ -167,7 +172,43 @@ def normalize_url(url: str) -> str:
     if not parsed.netloc:
         raise ValueError("URL must include a valid hostname.")
 
+    if parsed.username or parsed.password:
+        raise ValueError("URLs containing credentials are not supported.")
+
+    validate_public_url(url)
+
     return url
+
+
+def validate_public_url(url: str) -> None:
+    """Reject URL targets that resolve to local, private, or reserved networks."""
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Only public http and https URLs are supported.")
+
+    if parsed.port and parsed.port not in {80, 443}:
+        raise ValueError("Only standard HTTP and HTTPS ports are supported.")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"}:
+        raise ValueError("Local and private network targets are not allowed.")
+
+    try:
+        addresses = {
+            item[4][0]
+            for item in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80))
+        }
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve URL hostname: {hostname}") from exc
+
+    if not addresses:
+        raise ValueError(f"Could not resolve URL hostname: {hostname}")
+
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if not ip.is_global:
+            raise ValueError("Local, private, link-local, and reserved network targets are not allowed.")
 
 
 def clean_text(text: str) -> str:
@@ -205,11 +246,33 @@ def get_robots_url(target_url: str) -> str:
 
 def check_robots(target_url: str, user_agent: str) -> dict:
     robots_url = get_robots_url(target_url)
+    validate_public_url(robots_url)
     rp = RobotFileParser()
     rp.set_url(robots_url)
 
     try:
-        rp.read()
+        response = requests.get(
+            robots_url,
+            headers={"User-Agent": user_agent},
+            timeout=(5, 10),
+            allow_redirects=False,
+        )
+        if response.status_code == 200:
+            rp.parse(response.text.splitlines())
+        elif response.status_code in {401, 403}:
+            return {
+                "robots_url": robots_url,
+                "robots_checked": True,
+                "allowed": False,
+                "error": f"robots.txt returned HTTP {response.status_code}",
+            }
+        else:
+            return {
+                "robots_url": robots_url,
+                "robots_checked": True,
+                "allowed": True,
+                "error": f"robots.txt returned HTTP {response.status_code}; treated as no rules",
+            }
         return {
             "robots_url": robots_url,
             "robots_checked": True,
@@ -231,26 +294,99 @@ def fetch_html(url: str, user_agent: str) -> dict:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
+    current_url = url
+    response = None
+
     try:
-        response = requests.get(
-            url,
-            headers=headers,
-            timeout=45,
-            allow_redirects=True,
-        )
+        for _ in range(MAX_REDIRECTS + 1):
+            validate_public_url(current_url)
+            response = requests.get(
+                current_url,
+                headers=headers,
+                timeout=(8, 30),
+                allow_redirects=False,
+                stream=True,
+            )
+
+            if response.is_redirect or response.is_permanent_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise RuntimeError("Redirect response did not include a Location header.")
+                current_url = urljoin(current_url, location)
+                response.close()
+                continue
+            break
+        else:
+            raise RuntimeError(f"Too many redirects. Maximum allowed is {MAX_REDIRECTS}.")
     except requests.RequestException as exc:
         raise RuntimeError(f"Failed to fetch URL: {exc}") from exc
 
+    if response is None:
+        raise RuntimeError("The report fetch did not return a response.")
+
     content_type = response.headers.get("content-type", "")
+
+    if response.status_code < 400 and not any(item in content_type.lower() for item in ALLOWED_CONTENT_TYPES):
+        response.close()
+        raise RuntimeError(f"Expected an HTML report but received content type: {content_type or 'unknown'}")
+
+    content_length = response.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > MAX_RESPONSE_BYTES:
+        response.close()
+        raise RuntimeError("Report page is larger than the 5 MB safety limit.")
+
+    body = bytearray()
+    for chunk in response.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        body.extend(chunk)
+        if len(body) > MAX_RESPONSE_BYTES:
+            response.close()
+            raise RuntimeError("Report page exceeded the 5 MB safety limit.")
+
+    encoding = response.encoding or "utf-8"
+    html = bytes(body).decode(encoding, errors="replace")
 
     return {
         "input_url": url,
-        "final_url": response.url,
+        "final_url": current_url,
         "status_code": response.status_code,
         "content_type": content_type,
         "headers": dict(response.headers),
-        "html": response.text or "",
+        "html": html,
     }
+
+
+def build_article_chunks(text: str, chunk_size: int = 1800) -> list[dict]:
+    """Split normalized source text into stable, human-reviewable evidence chunks."""
+    text = clean_text(text)
+    if not text:
+        return []
+
+    chunks = []
+    start = 0
+    chunk_number = 1
+
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        if end < len(text):
+            boundary = text.rfind(". ", start, end)
+            if boundary > start + chunk_size // 2:
+                end = boundary + 1
+        chunk_text = text[start:end].strip()
+        if chunk_text:
+            chunks.append(
+                {
+                    "chunk_id": f"SRC-{chunk_number:04d}",
+                    "start": start,
+                    "end": end,
+                    "text": chunk_text,
+                }
+            )
+            chunk_number += 1
+        start = end
+
+    return chunks
 
 
 def extract_article_text(soup: BeautifulSoup) -> dict:
@@ -819,7 +955,7 @@ Page Title:
 Meta Description:
 {article["meta"].get("description", article["meta"].get("og:description", ""))}
 
-Validated Extracted IOCs:
+Extracted observable candidates (not independently verified):
 {compact_iocs}
 
 Sample Links:
@@ -886,7 +1022,7 @@ Page Title:
 Meta Description:
 {article["meta"].get("description", article["meta"].get("og:description", ""))}
 
-Validated Extracted IOCs:
+Extracted observable candidates (not independently verified):
 {compact_iocs}
 
 Article Text:
@@ -894,7 +1030,7 @@ Article Text:
 """
 
 def save_outputs(source_url: str, evidence: dict, ai_brief: str, easy_summary: str = "") -> dict:
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
     host = urlparse(source_url).netloc or "report"
     safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", host)
 
@@ -945,6 +1081,7 @@ def build_evidence(url: str, fetched: dict, article: dict, links: list, iocs: di
         if not ioc_type.startswith("_")
     }
 
+    full_article_text = article["article_text"]
     return {
         "scan_type": "threat_report_url_ioc_extraction",
         "timestamp_utc": datetime.now(UTC).isoformat(),
@@ -963,6 +1100,9 @@ def build_evidence(url: str, fetched: dict, article: dict, links: list, iocs: di
             "article_text_length": article["article_text_length"],
             "article_selector_used": article["article_selector_used"],
             "article_text_preview": article["article_text"][:4000],
+            "article_text": full_article_text,
+            "article_sha256": hashlib.sha256(full_article_text.encode("utf-8")).hexdigest(),
+            "chunks": build_article_chunks(full_article_text),
         },
         "iocs": iocs,
         "ioc_counts": clean_ioc_counts,

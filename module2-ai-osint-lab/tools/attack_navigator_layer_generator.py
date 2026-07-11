@@ -327,7 +327,7 @@ def build_layer(
         attack_major = attack_version.split(".", 1)[0]
 
     if not attack_major:
-        attack_major = "19"
+        raise RuntimeError("ATT&CK cache metadata is missing a release version. Sync the dataset before generating a layer.")
 
     layer = {
         "versions": {
@@ -389,7 +389,7 @@ def build_layer(
 
 
 def save_layer(layer: dict[str, Any]) -> dict[str, Path]:
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
 
     layer_path = OUTPUT_DIR / f"lab2_2_attack_navigator_layer_{timestamp}.json"
     latest_layer_path = OUTPUT_DIR / "lab2_2_latest_attack_navigator_layer.json"

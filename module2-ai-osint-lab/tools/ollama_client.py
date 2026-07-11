@@ -15,12 +15,14 @@ OLLAMA_HOST=http://192.168.1.10:11434
 """
 import json
 import os
+import re
 from typing import Any
 
 import requests
 
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
 
 GENERATE_URL = f"{OLLAMA_HOST}/api/generate"
 TAGS_URL = f"{OLLAMA_HOST}/api/tags"
@@ -144,47 +146,66 @@ def ask_ollama_json(
     Uses Ollama structured output: when a schema is supplied the model is
     constrained to it, otherwise plain JSON mode is requested.
     """
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": temperature,
-            "num_predict": num_predict,
-        },
-        "format": json_schema if json_schema else "json",
-    }
+    formats = [json_schema, "json"] if json_schema else ["json"]
+    errors = []
 
-    try:
-        response = requests.post(
-            GENERATE_URL,
-            headers={"Content-Type": "application/json"},
-            data=json.dumps(payload),
-            timeout=240,
-        )
-    except requests.RequestException as exc:
-        raise OllamaError(_unreachable_message()) from exc
+    for output_format in formats:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_predict": num_predict,
+                "num_ctx": OLLAMA_NUM_CTX,
+                "seed": 42,
+            },
+            "format": output_format,
+        }
 
-    if response.status_code != 200:
-        raise OllamaError(f"Ollama API error {response.status_code}: {response.text}")
+        try:
+            response = requests.post(
+                GENERATE_URL,
+                headers={"Content-Type": "application/json"},
+                json=payload,
+                timeout=360,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(str(exc))
+            continue
 
-    response_text = response.json().get("response", "").strip()
+        response_text = str(data.get("response", "")).strip()
+        if not response_text:
+            errors.append(
+                "empty response "
+                f"(done_reason={data.get('done_reason')}, "
+                f"prompt_tokens={data.get('prompt_eval_count')}, "
+                f"output_tokens={data.get('eval_count')})"
+            )
+            continue
 
-    if not response_text:
-        raise OllamaError("Ollama returned an empty JSON response.")
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", response_text, re.I | re.S)
+        if fenced:
+            response_text = fenced.group(1)
 
-    try:
-        parsed = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise OllamaError(
-            "Ollama did not return valid JSON even though structured output was requested. "
-            f"Raw response preview: {response_text[:1500]}"
-        ) from exc
+        try:
+            parsed = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            errors.append(f"invalid JSON: {exc}; preview={response_text[:500]}")
+            continue
 
-    if not isinstance(parsed, dict):
-        raise OllamaError("Ollama JSON response was valid JSON but not a JSON object.")
+        if isinstance(parsed, dict):
+            return parsed
 
-    return parsed
+        errors.append("valid JSON was returned, but it was not an object")
+
+    raise OllamaError(
+        "Ollama could not produce usable JSON after schema and plain-JSON attempts. "
+        f"Model={model}, context={OLLAMA_NUM_CTX}, prompt_chars={len(prompt)}. "
+        f"Details: {' | '.join(errors)}"
+    )
 
 
 if __name__ == "__main__":

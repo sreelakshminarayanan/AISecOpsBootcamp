@@ -270,10 +270,83 @@ def build_kql_dynamic_array(values: list[str], placeholder: str) -> str:
     clean_values = [normalize_text(value) for value in values if normalize_text(value)]
 
     if not clean_values:
-        return f'["{placeholder}"]'
+        return "[]"
 
     quoted = ", ".join([f'"{kql_escape(value)}"' for value in clean_values])
     return f"[{quoted}]"
+
+
+BEHAVIOR_TEMPLATES = {
+    "T1003": {
+        "spl": '''index=* earliest=-30d (process_name IN ("procdump.exe","rundll32.exe","powershell.exe","pwsh.exe","mimikatz.exe") OR process="*lsass*")
+| where like(lower(process), "%lsass%") OR like(lower(process), "%sekurlsa%") OR like(lower(process), "%comsvcs%")
+| stats count min(_time) as first_seen max(_time) as last_seen values(parent_process_name) as parents values(process) as command_lines by host user process_name
+| convert ctime(first_seen) ctime(last_seen)
+| sort - count''',
+        "kql": '''DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("procdump.exe", "rundll32.exe", "powershell.exe", "pwsh.exe", "mimikatz.exe")
+    or ProcessCommandLine has_any ("lsass", "sekurlsa", "comsvcs.dll")
+| where ProcessCommandLine has_any ("lsass", "sekurlsa", "comsvcs.dll")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine, SHA256
+| order by Timestamp desc''',
+    },
+    "T1059.001": {
+        "spl": '''index=* earliest=-30d process_name IN ("powershell.exe","pwsh.exe")
+| where match(lower(process), "(encodedcommand|frombase64string|downloadstring|invoke-expression|invoke-webrequest| iwr | iex )")
+| stats count min(_time) as first_seen max(_time) as last_seen values(parent_process_name) as parents values(process) as command_lines by host user process_name
+| convert ctime(first_seen) ctime(last_seen)
+| sort - count''',
+        "kql": '''DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName in~ ("powershell.exe", "pwsh.exe")
+| where ProcessCommandLine has_any ("EncodedCommand", "FromBase64String", "DownloadString", "Invoke-Expression", "Invoke-WebRequest", " iwr ", " iex ")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine, SHA256
+| order by Timestamp desc''',
+    },
+    "T1053.005": {
+        "spl": '''index=* earliest=-30d (process_name="schtasks.exe" OR EventCode IN (4698,4702))
+| stats count min(_time) as first_seen max(_time) as last_seen values(process) as command_lines values(TaskName) as task_names by host user EventCode
+| convert ctime(first_seen) ctime(last_seen)
+| sort - count''',
+        "kql": '''DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "schtasks.exe" or ProcessCommandLine has_all ("schtasks", "/create")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, ProcessCommandLine
+| order by Timestamp desc''',
+    },
+    "T1505.003": {
+        "spl": '''index=* earliest=-30d parent_process_name IN ("w3wp.exe","httpd.exe","apache2","nginx") process_name IN ("cmd.exe","powershell.exe","sh","bash")
+| stats count min(_time) as first_seen max(_time) as last_seen values(parent_process_name) as parents values(process) as command_lines by host user
+| convert ctime(first_seen) ctime(last_seen)
+| sort - count''',
+        "kql": '''DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where InitiatingProcessFileName in~ ("w3wp.exe", "httpd.exe", "apache2", "nginx.exe")
+| where FileName in~ ("cmd.exe", "powershell.exe", "pwsh.exe", "sh", "bash")
+| project Timestamp, DeviceName, AccountName, InitiatingProcessFileName, FileName, ProcessCommandLine
+| order by Timestamp desc''',
+    },
+    "T1566.002": {
+        "spl": '''index=* earliest=-30d (sourcetype=*email* OR sourcetype=*mail*) url!=""
+| stats count dc(recipient) as recipient_count values(sender) as senders values(subject) as subjects by url
+| where recipient_count < 10 OR count < 20
+| sort recipient_count count''',
+        "kql": '''EmailUrlInfo
+| where Timestamp > ago(30d)
+| join kind=inner (EmailEvents | project NetworkMessageId, RecipientEmailAddress, SenderFromAddress, Subject, DeliveryAction) on NetworkMessageId
+| summarize MessageCount=count(), Recipients=make_set(RecipientEmailAddress, 20), Senders=make_set(SenderFromAddress, 20), Subjects=make_set(Subject, 20) by Url, DeliveryAction
+| order by MessageCount asc''',
+    },
+}
+
+
+def get_behavior_template(attack_id: str) -> dict[str, str] | None:
+    if attack_id in BEHAVIOR_TEMPLATES:
+        return BEHAVIOR_TEMPLATES[attack_id]
+    if attack_id.startswith("T1003."):
+        return BEHAVIOR_TEMPLATES["T1003"]
+    return None
 
 
 def build_generic_splunk_hunt(row: pd.Series, iocs: dict[str, list[str]]) -> str:
@@ -281,34 +354,24 @@ def build_generic_splunk_hunt(row: pd.Series, iocs: dict[str, list[str]]) -> str
     name = normalize_text(row.get("name"))
     hunting_focus = normalize_text(row.get("hunting_focus"))
     log_sources = normalize_text(row.get("log_sources")) or normalize_text(row.get("data_sources"))
+    template = get_behavior_template(attack_id)
 
-    ioc_filter = build_splunk_filter(iocs)
-
-    if ioc_filter:
-        base_search = f"index=* earliest=-30d ({ioc_filter})"
-    else:
-        base_search = (
-            f'index=* earliest=-30d ("{splunk_escape(attack_id)}" OR "{splunk_escape(name)}")'
+    if not template:
+        return (
+            f"**Splunk behavioral hunt for {attack_id} - {name}**\n\n"
+            "No deterministic behavioral template is bundled for this technique. Use the cited source behavior and "
+            "ATT&CK data components to author a query for your telemetry. The lab does not generate a fake keyword search."
         )
 
-    query = f"""```spl
-{base_search}
-| eval attack_technique="{splunk_escape(attack_id)}", technique_name="{splunk_escape(name)}"
-| stats count min(_time) as first_seen max(_time) as last_seen values(user) as users values(src_ip) as src_ips values(dest_ip) as dest_ips values(process_name) as processes values(url) as urls by attack_technique technique_name host
-| convert ctime(first_seen) ctime(last_seen)
-| sort - count
-```"""
-
-    note = f"""**Splunk hunt starter for {attack_id} - {name}**
+    return f"""**Splunk behavioral hunt starter for {attack_id} - {name}**
 
 Suggested context:
-- Hunting focus: {hunting_focus or "Review the mapped ATT&CK behavior, source report evidence, and related observables before running this hunt."}
-- Suggested log sources from mapping: {log_sources or "Endpoint, identity, DNS, proxy, cloud audit, and application logs depending on the technique."}
+- Hunting focus: {hunting_focus or "Validate the source behavior in endpoint or security telemetry."}
+- Suggested log sources: {log_sources or "Tune this starter to the endpoint and security fields in your environment."}
 
-{query}
-"""
-
-    return note
+```spl
+{template['spl']}
+```"""
 
 
 def build_generic_kql_hunt(row: pd.Series, iocs: dict[str, list[str]]) -> str:
@@ -316,50 +379,77 @@ def build_generic_kql_hunt(row: pd.Series, iocs: dict[str, list[str]]) -> str:
     name = normalize_text(row.get("name"))
     hunting_focus = normalize_text(row.get("hunting_focus"))
     log_sources = normalize_text(row.get("log_sources")) or normalize_text(row.get("data_sources"))
+    template = get_behavior_template(attack_id)
 
-    domains = build_ioc_filter_text(iocs, ["domains"], 10)
-    urls = build_ioc_filter_text(iocs, ["urls"], 10)
-    ips = build_ioc_filter_text(iocs, ["ipv4s", "ips"], 10)
-    hashes = build_ioc_filter_text(iocs, ["sha256", "sha1", "md5", "hashes"], 12)
+    if not template:
+        return (
+            f"**Microsoft behavioral hunt for {attack_id} - {name}**\n\n"
+            "No deterministic Microsoft Defender or Sentinel template is bundled for this technique. Use the cited "
+            "source behavior and ATT&CK data components to author a query for the tables available in your tenant."
+        )
 
-    domain_block = build_kql_dynamic_array(domains, "replace-with-domain")
-    url_block = build_kql_dynamic_array(urls, "replace-with-url")
-    ip_block = build_kql_dynamic_array(ips, "replace-with-ip")
-    hash_block = build_kql_dynamic_array(hashes, "replace-with-hash")
-
-    query = f"""```kql
-let suspicious_domains = dynamic({domain_block});
-let suspicious_urls = dynamic({url_block});
-let suspicious_ips = dynamic({ip_block});
-let suspicious_hashes = dynamic({hash_block});
-union isfuzzy=true
-    DeviceNetworkEvents,
-    DeviceProcessEvents,
-    DeviceFileEvents,
-    DeviceEvents,
-    SigninLogs,
-    AuditLogs
-| where Timestamp > ago(30d)
-| where RemoteUrl has_any (suspicious_domains)
-    or RemoteUrl has_any (suspicious_urls)
-    or RemoteIP in (suspicious_ips)
-    or SHA256 in (suspicious_hashes)
-    or InitiatingProcessSHA256 in (suspicious_hashes)
-| extend AttackTechnique="{kql_escape(attack_id)}", TechniqueName="{kql_escape(name)}"
-| summarize EventCount=count(), FirstSeen=min(Timestamp), LastSeen=max(Timestamp), Users=make_set(AccountName, 20), Devices=make_set(DeviceName, 20), Processes=make_set(InitiatingProcessFileName, 20) by AttackTechnique, TechniqueName
-| order by EventCount desc
-```"""
-
-    note = f"""**Microsoft Sentinel / Defender KQL hunt starter for {attack_id} - {name}**
+    return f"""**Microsoft Sentinel / Defender behavioral hunt starter for {attack_id} - {name}**
 
 Suggested context:
-- Hunting focus: {hunting_focus or "Review the mapped ATT&CK behavior, source report evidence, and related observables before running this hunt."}
-- Suggested log sources from mapping: {log_sources or "Endpoint, identity, DNS, proxy, cloud audit, and application logs depending on the technique."}
+- Hunting focus: {hunting_focus or "Validate the source behavior in endpoint or security telemetry."}
+- Suggested log sources: {log_sources or "Tune this starter to the tables and fields available in your tenant."}
 
-{query}
-"""
+```kql
+{template['kql']}
+```"""
 
-    return note
+
+def build_ioc_hunt_section(iocs: dict[str, list[str]]) -> str:
+    domains = build_ioc_filter_text(iocs, ["domains"], 20)
+    urls = build_ioc_filter_text(iocs, ["urls"], 20)
+    ips = build_ioc_filter_text(iocs, ["ipv4s", "ips"], 20)
+    hashes = build_ioc_filter_text(iocs, ["sha256", "sha1", "md5", "hashes"], 30)
+
+    if not any([domains, urls, ips, hashes]):
+        return "_No network or file indicators are available for an IOC hunt._"
+
+    sections = []
+    spl_filter = build_splunk_filter(iocs)
+    if spl_filter:
+        sections.append(
+            "### Splunk IOC starter\n\n"
+            "```spl\n"
+            f"index=* earliest=-30d ({spl_filter})\n"
+            "| stats count min(_time) as first_seen max(_time) as last_seen values(user) as users values(process_name) as processes values(url) as urls by host src_ip dest_ip\n"
+            "| convert ctime(first_seen) ctime(last_seen)\n"
+            "| sort - count\n"
+            "```"
+        )
+
+    kql_parts = []
+    if domains or urls or ips:
+        kql_parts.append(
+            "let suspicious_domains = dynamic(" + build_kql_dynamic_array(domains, "") + ");\n"
+            "let suspicious_urls = dynamic(" + build_kql_dynamic_array(urls, "") + ");\n"
+            "let suspicious_ips = dynamic(" + build_kql_dynamic_array(ips, "") + ");\n"
+            "DeviceNetworkEvents\n"
+            "| where Timestamp > ago(30d)\n"
+            "| where (array_length(suspicious_domains) > 0 and RemoteUrl has_any (suspicious_domains))\n"
+            "    or (array_length(suspicious_urls) > 0 and RemoteUrl has_any (suspicious_urls))\n"
+            "    or (array_length(suspicious_ips) > 0 and RemoteIP in (suspicious_ips))\n"
+            "| project Timestamp, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, RemoteUrl, RemoteIP, RemotePort"
+        )
+    if hashes:
+        kql_parts.append(
+            "let suspicious_hashes = dynamic(" + build_kql_dynamic_array(hashes, "") + ");\n"
+            "union DeviceProcessEvents, DeviceFileEvents\n"
+            "| where Timestamp > ago(30d)\n"
+            "| where SHA256 in (suspicious_hashes) or SHA1 in (suspicious_hashes) or MD5 in (suspicious_hashes)\n"
+            "| project Timestamp, DeviceName, AccountName, FileName, FolderPath, SHA256, SHA1, MD5"
+        )
+
+    if kql_parts:
+        sections.append(
+            "### Microsoft Defender IOC starters\n\n"
+            + "\n\n".join(f"```kql\n{query}\n```" for query in kql_parts)
+        )
+
+    return "\n\n".join(sections)
 
 
 def build_technique_section(row: pd.Series, iocs: dict[str, list[str]]) -> str:
@@ -554,6 +644,13 @@ This is not production detection content. It is an analyst starter pack. Every q
     )
 
     sections.append(
+        "## Separate IOC Hunt\n\n"
+        "This section searches extracted network and file indicators. It is separate from ATT&CK behavioral hunting. "
+        "Validate report attribution and tune fields before use.\n\n"
+        + build_ioc_hunt_section(iocs)
+    )
+
+    sections.append(
         """## Environment Tuning Checklist
 
 Before running the hunts, define:
@@ -615,7 +712,7 @@ Use this before presenting results:
 
 
 def save_outputs(markdown_report: str, json_payload: dict[str, Any]) -> dict[str, Path]:
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
 
     md_path = OUTPUT_DIR / f"lab2_2_hunting_pack_{timestamp}.md"
     json_path = OUTPUT_DIR / f"lab2_2_hunting_pack_{timestamp}.json"
@@ -658,11 +755,10 @@ def run(
     review_df = load_csv_if_exists(review_path)
     ioc_df = load_csv_if_exists(iocs_path)
 
-    easy_summary_path = find_latest_file("lab2_1_easy_summary_*.md")
-    analyst_brief_path = find_latest_file("lab2_1_ai_brief_*.md")
-
-    easy_summary = read_text_if_exists(easy_summary_path)
-    analyst_brief = read_text_if_exists(analyst_brief_path)
+    # Keep the hunting pack tied to approved mappings and cited source evidence.
+    # AI summaries are intentionally not reused as evidence in downstream artifacts.
+    easy_summary = ""
+    analyst_brief = ""
 
     if not source_url:
         evidence_path = find_latest_file("lab2_1_report_osint_*.json")
