@@ -238,6 +238,11 @@ A good starter report for testing:
 https://unit42.paloaltonetworks.com/ak47-activity-linked-to-sharepoint-vulnerabilities/
 ```
 
+Online version of he tool : 
+
+https://ttpmapper.urvesh.fyi/
+
+
 ---
 
 ## Running the tests
