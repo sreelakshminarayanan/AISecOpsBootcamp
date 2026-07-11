@@ -221,6 +221,8 @@ export OLLAMA_HOST="http://192.168.1.10:11434"
 
 Streamlit prints a local URL, usually http://localhost:8501
 
+
+https://github.com/KunalCyber/GRC-Prompts-Library
 ---
 
 ## Using the workbench
